@@ -1,5 +1,6 @@
 import argparse
 import hopsworks
+import numpy as np
 import pandas as pd
 from hsfs.feature import Feature
 
@@ -7,7 +8,7 @@ from hsfs import embedding
 
 import tensorflow as tf
 
-def build_feature_store(de):
+def build_feature_store(de, project):
     catalog_config = de._configs_dict["product_list"]
             
     ### Creating Items FG ###
@@ -15,7 +16,7 @@ def build_feature_store(de):
         Feature(name=feat, type=val["type"])
         for feat, val in catalog_config["schema"].items()
     ]
-    item_features.append(Feature(name='embeddings', type="ARRAY <double>"))
+    item_features.append(Feature(name='embeddings', type="ARRAY<double>"))
 
     emb = embedding.EmbeddingIndex()
     emb.add_embedding(
@@ -23,7 +24,8 @@ def build_feature_store(de):
         de._configs_dict['model_configuration']['retrieval_model']['item_space_dim'], 
     )
 
-    de._items_fg = de._fs.create_feature_group(
+    fs = project.get_feature_store()
+    de._items_fg = fs.create_feature_group(
         name=de._prefix + catalog_config["feature_view_name"],
         description="Catalog for the Decision Engine project",
         embedding_index=emb,  
@@ -35,14 +37,14 @@ def build_feature_store(de):
     de._items_fg.save()
     
     ### Creating Items FV ###
-    items_fv = de._fs.create_feature_view(
+    items_fv = fs.create_feature_view(
         name=de._prefix + catalog_config["feature_view_name"],
         query=de._items_fg.select_all(),
         version=1,
     )
 
     ### Creating Events FG ###
-    events_fg = de._fs.create_feature_group(
+    events_fg = fs.create_feature_group(
         name=de._prefix + "events",
         description="Events stream for the Decision Engine project",
         primary_key=["event_id"],
@@ -73,7 +75,7 @@ def build_feature_store(de):
     events_fg.save(features=events_features)
 
     ### Creating Events FV ###
-    events_fv = de._fs.create_feature_view(
+    events_fv = fs.create_feature_view(
         name=de._prefix + "events",
         query=events_fg.select_all(),
         version=1,
@@ -86,7 +88,7 @@ def build_feature_store(de):
     )
 
     ### Creating Decisions FG ###
-    decisions_fg = de._fs.create_feature_group(
+    decisions_fg = fs.create_feature_group(
         name=de._prefix + "decisions",
         description="Decisions logging for the Decision Engine project",
         primary_key=["decision_id", "session_id"],
@@ -109,24 +111,10 @@ def build_feature_store(de):
     ]
     decisions_fg.save(features=decisions_features)
 
-def ingest_data(de):
+def ingest_data(de, project):
     
-    items_ds = tf.data.Dataset.from_tensor_slices(
-        {col: de._catalog_df[col] for col in de._catalog_df}
-    )
-    try: 
-        candidate_model = de._mr.get_model(de._prefix + "candidate_model")
-    except:
-        print(f"Error occured while retrieving model {de._prefix + "candidate_model"}.")
-        candidate_model = lambda x: tf.random.normal(shape=(2048, 128))
-        
-    item_embeddings = items_ds.batch(2048).map(
-        lambda x: (x[de._configs_dict["product_list"]["primary_key"]], candidate_model(x)) 
-    )
-    all_embeddings_list = tf.concat([batch[1] for batch in item_embeddings], axis=0).numpy().tolist()
-    
-    # Reading items data into Pandas df to insert into Items FG
-    downloaded_file_path = de._dataset_api.download(
+    dataset_api = project.get_dataset_api()
+    downloaded_file_path = dataset_api.download(
         de._configs_dict["product_list"]["file_path"], overwrite=True
     )
     catalog_df = pd.read_csv(
@@ -137,12 +125,35 @@ def ingest_data(de):
             if val["type"] == "timestamp"
         ],
     )
-    catalog_df['embeddings'] = all_embeddings_list
+    
     catalog_df[de._configs_dict["product_list"]["primary_key"]] = catalog_df[
         de._configs_dict["product_list"]["primary_key"]
     ].astype(str)
-    de._items_fg.insert(catalog_df[list(de._configs_dict["product_list"]["schema"].keys()) + ['embeddings']])
+    catalog_df_copy = catalog_df.copy()
+    
+    for feat, val in de._configs_dict["product_list"]["schema"].items():
+        if val["type"] == "float":
+            catalog_df[feat] = catalog_df[feat].astype("float32")
+        if "transformation" in val.keys() and val["transformation"] == "timestamp":
+            catalog_df[feat] = catalog_df[feat].astype(np.int64) // 10**9
+        
+    items_ds = tf.data.Dataset.from_tensor_slices(
+        {col: catalog_df[col] for col in catalog_df}
+    )
+    try: 
+        mr = project.get_model_registry()
+        candidate_model = mr.get_model(de._prefix + "candidate_model")
+    except:
+        print(f"Error occured while retrieving model {de._prefix + 'candidate_model'}.")
+        candidate_model = lambda x: tf.random.normal(shape=(2048, 128))
+        
+    item_embeddings = items_ds.batch(2048).map(
+        lambda x: (x[de._configs_dict["product_list"]["primary_key"]], candidate_model(x)) 
+    )
+    all_embeddings_list = tf.concat([batch[1] for batch in item_embeddings], axis=0).numpy().tolist()[:catalog_df.shape[0]]
 
+    catalog_df_copy['embeddings'] = all_embeddings_list
+    de._items_fg.insert(catalog_df_copy[list(de._configs_dict["product_list"]["schema"].keys()) + ['embeddings']])
         
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -151,7 +162,7 @@ if __name__ == "__main__":
 
     project = hopsworks.login()
     de_api = project.get_decision_engine_api()
-    de = de_api.get_by_name(args['name'])
+    de = de_api.get_by_name(args.name)
     
-    build_feature_store(de)
-    ingest_data(de)
+    build_feature_store(de, project)
+    ingest_data(de, project)

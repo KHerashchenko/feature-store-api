@@ -10,7 +10,7 @@ from xgboost import XGBRegressor
 import joblib
 from hsml.transformer import Transformer
 from hsml.client.exceptions import ModelServingException
-import decision_engine_model
+from hopsworks.engine import decision_engine_model
 import sys
     
 BATCH_SIZE = 2048
@@ -35,8 +35,8 @@ def df_to_ds(df, pad_length=10):
 
     return tf.data.Dataset.from_tensor_slices(features)
 
-def load_data(de):
-    events_fg = de._fs.get_feature_group(name=de._prefix + "events")
+def load_data(de, fs):
+    events_fg = fs.get_feature_group(name=de._prefix + "events")
     try:
         events_df = events_fg.read(dataframe_type="pandas")
         events_df["event_timestamp"] = (
@@ -45,7 +45,7 @@ def load_data(de):
     except: #TODO bad practice
         events_df = pd.DataFrame()        
 
-    items_fg = de._fs.get_feature_group(
+    items_fg = fs.get_feature_group(
         name=de._prefix + de._configs_dict["product_list"]["feature_view_name"]
     )
     items_df = items_fg.read(dataframe_type="pandas")
@@ -76,8 +76,8 @@ def compute_fg_size(events_fg):
     return fg_size
 
 
-def compute_td_size(de):
-    events_fv = de._fs.get_feature_view(name=de._prefix + "events")
+def compute_td_size(de, fs):
+    events_fv = fs.get_feature_view(name=de._prefix + "events")
 
     td_version = max(events_fv.get_training_datasets(), key=lambda m: m.version).version
     print(f"Retrieving training dataset of version {td_version}")
@@ -176,14 +176,14 @@ def preprocess_ranking_train_df(events_df, items_df, config):
     ranking_train_df.drop(['session_id', 'item_id'] + event_types, inplace=True, axis=1)
     return ranking_train_df
 
-def save_model_to_registry(model_name, description, tensorflow=True):
+def save_model_to_registry(mr, model_name, description, tensorflow=True):
     if tensorflow:
-        retrained_model = de._mr.tensorflow.create_model(
+        retrained_model = mr.tensorflow.create_model(
             name=de._prefix + model_name,
             description=description,
         )
     else:
-        retrained_model = de._mr.python.create_model(
+        retrained_model = mr.python.create_model(
             name=de._prefix + model_name,
             description=description,
         )
@@ -214,8 +214,8 @@ def update_deployment(deployment, project_name, new_version, model_name):
     except ModelServingException as e:
         print(f"deployment.save(await_update=120) failed. {e}")
 
-def create_deployment(de, project_name, new_version, model_name, deployment_name, description):
-    mr_model = de._mr.get_model(name=de._prefix + model_name, version=new_version)
+def create_deployment(de, mr, project_name, new_version, model_name, deployment_name, description):
+    mr_model = mr.get_model(name=de._prefix + model_name, version=new_version)
 
     transformer_script_path = os.path.join(
         "/Projects",
@@ -271,9 +271,12 @@ if __name__ == "__main__":
 
     project = hopsworks.login()
     de_api = project.get_decision_engine_api()
-    de = de_api.get_by_name(args['name'])
+    de = de_api.get_by_name(args.name)
+    fs = project.get_feature_store()
+    mr = project.get_model_registry()
+    ms = project.get_model_serving()
     
-    events_fg, events_df, items_fg, items_df = load_data(de)
+    events_fg, events_df, items_fg, items_df = load_data(de, fs)
 
     ### Create Retrieval Two-Tower Model ###
     pk_index_list = items_df[de._configs_dict["product_list"]["primary_key"]].unique().tolist()
@@ -298,7 +301,7 @@ if __name__ == "__main__":
     if not events_df.empty:
         if de._configs_dict["model_configuration"]["retrain"]["type"] == "ratio_threshold":
             fg_size = compute_fg_size(events_fg)
-            td_size = compute_td_size(de)
+            td_size = compute_td_size(de, fs)
 
             # Comparing data sizes
             if not fg_size or (
@@ -325,15 +328,16 @@ if __name__ == "__main__":
         instances_spec
     )
     tf.saved_model.save(model.query_model, "query_model", signatures=signatures)
-    new_query_model_v = save_model_to_registry("query_model", "Model that generates embeddings from session interaction sequence")
+    new_query_model_v = save_model_to_registry(mr, "query_model", "Model that generates embeddings from session interaction sequence")
     
     ### Deploy Query model ###
     deployment_name = (de._prefix + "query_deployment").replace("_", "").lower()
     try:
-        deployment = de._ms.get_deployment(deployment_name)
+        deployment = ms.get_deployment(deployment_name)
     except:
         create_deployment(
             de,
+            mr,
             project.name,
             new_query_model_v,
             "query_model",
@@ -350,12 +354,12 @@ if __name__ == "__main__":
     
     ### Register Candidate model ###
     tf.saved_model.save(model.item_model, "candidate_model")
-    new_candidate_model_v = save_model_to_registry("candidate_model", "Model that generates embeddings from item features")
+    new_candidate_model_v = save_model_to_registry(mr, "candidate_model", "Model that generates embeddings from item features")
 
     if not events_df.empty:
         new_ranking_model = XGBRegressor(enable_categorical=True)
         
-        ### TODO Train Ranking Model ###
+        ### Train Ranking Model ###
         train_df = preprocess_ranking_train_df(events_df, items_df, de._configs_dict)
         feature_cols = [col for col in train_df.columns if col != 'score']
         X_train = train_df[feature_cols]
@@ -372,15 +376,16 @@ if __name__ == "__main__":
         if os.path.isdir(model_dir) == False:
             os.mkdir(model_dir)
         joblib.dump(new_ranking_model, model_dir + "/ranking_model.pkl")
-        new_ranking_model_v = save_model_to_registry("ranking_model", "Ranking model that scores item candidates")
+        new_ranking_model_v = save_model_to_registry(mr, "ranking_model", "Ranking model that scores item candidates")
         
         ### Deploy Ranking model ###
         deployment_name = (de._prefix + "ranking_deployment").replace("_", "").lower()
         try: 
-            deployment = de._ms.get_deployment(deployment_name)
+            deployment = ms.get_deployment(deployment_name)
         except:
             create_deployment(
                 de,
+                mr,
                 project.name,
                 new_ranking_model_v,
                 "ranking_model",
