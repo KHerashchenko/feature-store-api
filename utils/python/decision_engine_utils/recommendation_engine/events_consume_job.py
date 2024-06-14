@@ -5,12 +5,12 @@ import hopsworks
 import argparse
 from pyspark.sql import SparkSession
 from pyspark.sql.types import StructType, StructField, LongType, StringType, TimestampType, DoubleType
-from pyspark.sql.functions import from_json
-from hsfs.feature import Feature
+from pyspark.sql.functions import from_json  
 
 # Setting up argparse
 parser = argparse.ArgumentParser()
 parser.add_argument("-name", type=str, help="Name of DE project", default='none')
+parser.add_argument("-start_time", default=None)  # to be ignored
 args = parser.parse_args()
 
 logging.basicConfig(level=logging.INFO)
@@ -23,7 +23,9 @@ fs = project.get_feature_store()
 
 import yaml
 dataset_api = project.get_dataset_api()
-downloaded_file_path = dataset_api.download(f"Resources/decision-engine/{args.name}/configuration.yml")
+de_api = project.get_decision_engine_api()
+decision_engine = de_api.get_by_name(args.name)
+downloaded_file_path = dataset_api.download(decision_engine._config_file_path, overwrite=True)
 with open(downloaded_file_path, "r") as f:
     config = yaml.safe_load(f)
 prefix = 'de_' + config['name'] + '_'
@@ -72,18 +74,13 @@ df_deser = df_read.selectExpr("CAST(value AS STRING)") \
 
 events_fg = fs.get_feature_group(prefix + "events")
 fg_stream_query = events_fg.insert_stream(df_deser)
-# print(fg_stream_query.status)
+print(fg_stream_query.status)
 time.sleep(60) 
 
 while fg_stream_query.status['isDataAvailable']:
     print(fg_stream_query.status)
-    time.sleep(10) 
+    time.sleep(60)
 
 print("Data processing completed.")
 fg_stream_query.stop()
 spark.stop()
-
-print("Populating offline FG.")
-jb = project.get_jobs_api()
-job = jb.get_job(prefix + "events_1_offline_fg_materialization")
-execution = job.run()

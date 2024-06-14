@@ -20,6 +20,8 @@ from hopsworks.engine import decision_engine_model
 
 logging.basicConfig(level=logging.INFO)
 
+BATCH_SIZE = 2048
+
 def df_to_ds(df, pad_length=10):
     features = {
         col: tf.convert_to_tensor(df[col])
@@ -48,9 +50,9 @@ def login_to_project(args):
     ms = project.get_model_serving()
     opensearch_api = project.get_opensearch_api()
     dataset_api = project.get_dataset_api()
-    downloaded_file_path = dataset_api.download(
-        f"Resources/decision-engine/{args.name}/configuration.yml", overwrite=True
-    )
+    de_api = project.get_decision_engine_api()
+    decision_engine = de_api.get_by_name(args.name)
+    downloaded_file_path = dataset_api.download(decision_engine._config_file_path, overwrite=True)
     with open(downloaded_file_path, "r") as f:
         config = yaml.safe_load(f)
     prefix = "de_" + config["name"] + "_"
@@ -59,10 +61,13 @@ def login_to_project(args):
 
 def load_data(fs, prefix, config):
     events_fg = fs.get_feature_group(name=prefix + "events")
-    events_df = events_fg.read(dataframe_type="pandas")
-    events_df["event_timestamp"] = (
-        events_df["event_timestamp"].astype(np.int64) // 10**9
-    )
+    try:
+        events_df = events_fg.read(dataframe_type="pandas")
+        events_df["event_timestamp"] = (
+            events_df["event_timestamp"].astype(np.int64) // 10**9
+        )
+    except: #TODO its a bad practice
+        events_df = pd.DataFrame()
 
     items_fg = fs.get_feature_group(
         name=prefix + config["product_list"]["feature_view_name"]
@@ -76,16 +81,16 @@ def load_data(fs, prefix, config):
     items_df[config["product_list"]["primary_key"]] = items_df[
         config["product_list"]["primary_key"]
     ].astype(str)
+    items_df.drop("embeddings", axis=1, inplace=True)
 
     return events_fg, events_df, items_fg, items_df
 
 
 def compute_fg_size(events_fg):
-    try:
-        fg_stat = events_fg.statistics
-    except Exception as e:
-        logging.info(f"Couldn't retrieve events FG statistics. Quitting. Error: {e}")
+    fg_stat = events_fg.statistics
+    if not fg_stat:
         # no data available yet - no events received
+        logging.info(f"Couldn't retrieve events FG statistics. Quitting.")
         sys.exit()
 
     fg_size = next(
@@ -254,14 +259,17 @@ def preprocess_ranking_train_df(events_df, items_df, config):
                 
         policy_expr = config["model_configuration"]["ranking_model"]["policy_config"]
         items_scores['score'] = items_scores.eval(policy_expr)
+        items_scores.reset_index()  
     else:
-        items_scores = events_df.groupby(['session_id', 'item_id'])['event_weight'].transform('sum') 
-
-    events_df_unique = events_df[['item_id', 'session_id', 'longitude', 'latitude', 'language', 'useragent']].drop_duplicates()
+        event_types = []
+        items_scores = events_df.groupby(['session_id', 'item_id'])['event_weight'].sum().reset_index()
+        items_scores.columns = ['session_id', 'item_id', 'score']
     
+    events_df_unique = events_df[['item_id', 'session_id', 'longitude', 'latitude', 'language', 'useragent']].drop_duplicates()
     ranking_train_df = pd.merge(events_df_unique, items_scores, on=['session_id', 'item_id'], how='inner')
     ranking_train_df = pd.merge(ranking_train_df, items_df, left_on='item_id', right_on=config["product_list"]["primary_key"], how='inner')
     ranking_train_df.drop(['session_id', 'item_id'] + event_types, inplace=True, axis=1)
+    print('ranking_train_df: ', ranking_train_df.describe())
     return ranking_train_df
 
 
@@ -329,49 +337,65 @@ def create_deployment(mr, project, new_version, prefix, model_name, deployment_n
     )
 
 
-def update_opensearch_index(items_df, opensearch_api, config, candidate_model, prefix):
-    client = OpenSearch(**opensearch_api.get_default_py_config())
-    
-    index_name = opensearch_api.get_project_index(
-        config["product_list"]["feature_view_name"]
-    )
-
+def update_opensearch_index(items_fg, config, candidate_model, items_df):
+    primary_key = config["product_list"]["primary_key"]
     items_ds = tf.data.Dataset.from_tensor_slices(
         {col: items_df[col] for col in items_df}
     )
     item_embeddings = items_ds.batch(2048).map(
         lambda x: (
-            x[config["product_list"]["primary_key"]],
+            x[primary_key],
             candidate_model(x),
         )
     )
-
-    actions = []
-    for batch in item_embeddings:
-        item_id_list, embedding_list = batch
-        item_id_list = item_id_list.numpy().astype(int)
-        embedding_list = embedding_list.numpy()
-        
-        for item_id, embedding in zip(item_id_list, embedding_list):
-        
-            actions.append({"update": { "_index": index_name, "_id": int(item_id)}})
-            actions.append({'doc': {prefix + "vector": embedding.tolist()}})
-
-    print(f"Example item vectors to be bulked: {actions[:10]}")
-    client.bulk(actions)
+    all_pk_list = tf.concat([batch[0] for batch in item_embeddings], axis=0).numpy().tolist()
+    all_pk_list = [pk.decode('utf-8') for pk in all_pk_list]
+    all_embeddings_list = tf.concat([batch[1] for batch in item_embeddings], axis=0).numpy().tolist()
+    data_emb = pd.DataFrame({
+        primary_key: all_pk_list, 
+        'embeddings': all_embeddings_list,
+    })
+    print('data_emb: ', data_emb.head())
+    # items_fg.insert(data_emb) 
+    # TODO this doesnt work because it requires all columns to insert. i cant upsert only embeddings
+    # Down here is workaround
+    dataset_api = project.get_dataset_api()
+    downloaded_file_path = dataset_api.download(config["product_list"]["file_path"], overwrite=True)    
+    catalog_df = pd.read_csv(
+        downloaded_file_path,
+        parse_dates=[
+            feat
+            for feat, val in config["product_list"]["schema"].items()
+            if val["type"] == "timestamp"
+        ],
+    )
+    catalog_df[config["product_list"]["primary_key"]] = catalog_df[
+            config["product_list"]["primary_key"]
+        ].astype(str)
+    data_emb = pd.merge(data_emb, catalog_df[list(config["product_list"]["schema"].keys())], on=primary_key, how="right")
+    items_fg.insert(data_emb)
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("-name", type=str, help="Name of DE project", default="none")
+    parser.add_argument("-start_time", default=None)  # to be ignored
     args = parser.parse_args()
 
     project, fs, mr, ms, prefix, config, opensearch_api = login_to_project(args)
+    
+    # print("Populating offline Events FG.")
+    # jb = project.get_jobs_api()
+    # job = jb.get_job(prefix + "events_1_offline_fg_materialization")
+    # execution = job.run()
+    # execution.await_termination()
+        
     events_fg, events_df, items_fg, items_df = load_data(fs, prefix, config)
 
     if config["model_configuration"]["retrain"]["type"] == "ratio_threshold":
         fg_size = compute_fg_size(events_fg)
         td_size = compute_td_size(fs, prefix + "events")
+        print('fg_size: ', fg_size, ', td_size: ', td_size)
 
         # Comparing data
         if not fg_size or (
@@ -405,7 +429,7 @@ if __name__ == "__main__":
     
     current_model = mr.get_model(prefix + "query_model")
     new_version = save_model_to_registry(mr, prefix, "candidate_model", current_model.description)
-    update_opensearch_index(items_df, opensearch_api, config, candidate_model, prefix)
+    update_opensearch_index(items_fg, config, candidate_model, items_df)
 
     # Ranking model
     train_ds = preprocess_ranking_train_df(events_df, items_df, config)

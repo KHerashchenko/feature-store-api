@@ -22,6 +22,10 @@ class Transformer(object):
         self.ranking_deployment_name = (self.prefix + "ranking_deployment").replace("_", "").lower()
         self.os_api = self.project.get_opensearch_api()
         fs = self.project.get_feature_store()
+        self.items_fg = fs.get_feature_group(
+            name=self.prefix + self.config['product_list']["feature_view_name"], 
+            version=1,
+        )
         self.items_fv = fs.get_feature_view(
             name=self.prefix + self.config["product_list"]["feature_view_name"],
             version=1,
@@ -32,13 +36,8 @@ class Transformer(object):
 
         context_item_ids = self.inputs['context_item_ids']
         if not context_item_ids: 
-            fs = self.project.get_feature_store()
-            items_fg = fs.get_feature_group(
-                name=self.prefix + self.config['product_list']["feature_view_name"], 
-                version=1,
-            )
             pk_col = self.config['product_list']['primary_key']
-            context_item_ids = items_fg.select([pk_col]).show(5)[pk_col].tolist()
+            context_item_ids = self.items_fg.select([pk_col]).show(5)[pk_col].tolist()
 
         model_input = [{'context_item_ids': list(map(str, context_item_ids))}]
         print("model input: ", model_input)
@@ -57,8 +56,21 @@ class Transformer(object):
         self.decision_id = self.inputs.pop("decision_id")
         self.context_item_ids = self.inputs.pop("context_item_ids")
         
-        neighbors = self.search_candidates(self.prefix, query_emb, k=100)
-        item_id_list = [int(el["_id"]) for el in neighbors]
+        neighbors = self.items_fg.find_neighbors(
+            query_emb, 
+            k=100,
+        )
+        
+        # TODO bichass workaround cause find_neighbors does not return PK or feature names
+        def find_feature_index(features, feature_name):
+            for index, feature in enumerate(features):
+                if feature.name == feature_name:
+                    return index
+
+        pk_index = find_feature_index(self.items_fg.features, self.config['product_list']['primary_key'])
+        item_id_list = [neighbor[1][pk_index] for neighbor in neighbors]
+        print('neighbors:', neighbors)
+        
         items_df = self.items_fv.get_feature_vectors(
             entry=[
                 {self.config["product_list"]["primary_key"]: it_id}
@@ -66,7 +78,8 @@ class Transformer(object):
             ],
             return_type="pandas",
         )
-        scores = {int(el['_id']): el["_score"] for el in neighbors}
+        items_df.drop("embeddings", axis=1, inplace=True)
+        scores = {neighbor[1][pk_index]: neighbors[0] for neighbor in neighbors}
         print('scores: ', scores)
         items_df['score'] = items_df[self.config["product_list"]["primary_key"]].map(scores)
         items_df['score'].fillna(0, inplace=True)
@@ -94,12 +107,3 @@ class Transformer(object):
             print('ranking model input: ', model_input)      
             return deployment.predict(model_input)
         
-    def search_candidates(self, prefix, query_emb, k=100):
-        query = {
-            "size": k,
-            "query": {"knn": {prefix + "vector": {"vector": query_emb, "k": k}}},
-        }
-        print("os input: ", query, self.item_index)
-        results = self.os_client.search(body=query, index=self.item_index)
-        print('os output: ', results)
-        return results["hits"]["hits"]
