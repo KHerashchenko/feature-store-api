@@ -384,11 +384,11 @@ if __name__ == "__main__":
 
     project, fs, mr, ms, prefix, config, opensearch_api = login_to_project(args)
     
-    # print("Populating offline Events FG.")
-    # jb = project.get_jobs_api()
-    # job = jb.get_job(prefix + "events_1_offline_fg_materialization")
-    # execution = job.run()
-    # execution.await_termination()
+    print("Populating offline Events FG.")
+    jb = project.get_jobs_api()
+    job = jb.get_job(prefix + "events_1_offline_fg_materialization")
+    execution = job.run()
+    execution.await_termination()
         
     events_fg, events_df, items_fg, items_df = load_data(fs, prefix, config)
 
